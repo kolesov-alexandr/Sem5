@@ -107,4 +107,7 @@
   <ItemGroup>
     <None Include="packages.config" />
   </ItemGroup>
+  <ItemGroup>
+    <FxCompile Include="Shaders\EdgeDetection.hlsl" />
+  </ItemGroup>
 </Project>

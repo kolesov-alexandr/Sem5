@@ -1,7 +1,3 @@
-//***************************************************************************************
-// RenderingSystem.cpp by Maxim Kasik (C) 2025 All Rights Reserved.
-//***************************************************************************************
-
 #include "RenderingSystem.h"
 
 using namespace DirectX;
@@ -231,6 +227,135 @@ const std::unordered_map<std::string, ComPtr<ID3DBlob>>& RenderingSystem::GetSha
 const std::unordered_map<std::string, ComPtr<ID3D12PipelineState>>& RenderingSystem::GetPSOs() const
 {
     return mPSOs;
+}
+
+void RenderingSystem::BuildEdgeDetectionPSO()
+{
+    // Компилируем шейдеры
+    auto edgeDetectionVS = d3dUtil::CompileShader(L"Shaders\\EdgeDetection.hlsl", nullptr, "VS", "vs_5_1");
+    auto edgeDetectionPS = d3dUtil::CompileShader(L"Shaders\\EdgeDetection.hlsl", nullptr, "PS", "ps_5_1");
+
+    // Создаем корневую сигнатуру
+    CD3DX12_DESCRIPTOR_RANGE srvTable;
+    srvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+
+    CD3DX12_ROOT_PARAMETER slotRootParameter[2];
+    slotRootParameter[0].InitAsDescriptorTable(1, &srvTable, D3D12_SHADER_VISIBILITY_PIXEL);
+    slotRootParameter[1].InitAsConstantBufferView(0);
+
+    CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(2, slotRootParameter,
+        0, nullptr,
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+    ComPtr<ID3DBlob> serializedRootSig = nullptr;
+    ComPtr<ID3DBlob> errorBlob = nullptr;
+    ThrowIfFailed(D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+        serializedRootSig.GetAddressOf(), errorBlob.GetAddressOf()));
+
+    ThrowIfFailed(mDevice->CreateRootSignature(
+        0,
+        serializedRootSig->GetBufferPointer(),
+        serializedRootSig->GetBufferSize(),
+        IID_PPV_ARGS(mEdgeDetectionRootSignature.GetAddressOf())));
+
+    // Создаем PSO
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC edgeDetectionPsoDesc = {};
+    edgeDetectionPsoDesc.InputLayout = { nullptr, 0 }; // Используем SV_VertexID
+    edgeDetectionPsoDesc.pRootSignature = mEdgeDetectionRootSignature.Get();
+    edgeDetectionPsoDesc.VS = {
+        reinterpret_cast<BYTE*>(edgeDetectionVS->GetBufferPointer()),
+        edgeDetectionVS->GetBufferSize()
+    };
+    edgeDetectionPsoDesc.PS = {
+        reinterpret_cast<BYTE*>(edgeDetectionPS->GetBufferPointer()),
+        edgeDetectionPS->GetBufferSize()
+    };
+    edgeDetectionPsoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    edgeDetectionPsoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    edgeDetectionPsoDesc.DepthStencilState.DepthEnable = FALSE;
+    edgeDetectionPsoDesc.DepthStencilState.StencilEnable = FALSE;
+    edgeDetectionPsoDesc.SampleMask = UINT_MAX;
+    edgeDetectionPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    edgeDetectionPsoDesc.NumRenderTargets = 1;
+    edgeDetectionPsoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM; // Формат вывода
+    edgeDetectionPsoDesc.SampleDesc.Count = 1;
+    edgeDetectionPsoDesc.SampleDesc.Quality = 0;
+
+    ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&edgeDetectionPsoDesc,
+        IID_PPV_ARGS(&mEdgeDetectionPSO)));
+
+    // Создаем константный буфер
+    mEdgeDetectionCB = std::make_unique<UploadBuffer<EdgeDetectionConstants>>(
+        mDevice, 1, true);
+}
+
+void RenderingSystem::ExecuteEdgeDetection(
+    ID3D12GraphicsCommandList* cmdList,
+    ID3D12Resource* inputTexture,
+    D3D12_CPU_DESCRIPTOR_HANDLE inputSRV,
+    ID3D12Resource* outputTexture,
+    D3D12_CPU_DESCRIPTOR_HANDLE outputRTV,
+    UINT width, UINT height)
+{
+    // Переход ресурсов в нужные состояния
+    CD3DX12_RESOURCE_BARRIER barriers[] = {
+        CD3DX12_RESOURCE_BARRIER::Transition(
+            inputTexture,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        CD3DX12_RESOURCE_BARRIER::Transition(
+            outputTexture,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET)
+    };
+    cmdList->ResourceBarrier(_countof(barriers), barriers);
+
+    // Устанавливаем PSO и корневую сигнатуру
+    cmdList->SetPipelineState(mEdgeDetectionPSO.Get());
+    cmdList->SetGraphicsRootSignature(mEdgeDetectionRootSignature.Get());
+
+    // Устанавливаем дескрипторы
+    ID3D12DescriptorHeap* ppHeaps[] = { mSrvDescriptorHeap.Get() };
+    cmdList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+
+    cmdList->SetGraphicsRootDescriptorTable(0,
+        mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+
+    // Обновляем константный буфер
+    EdgeDetectionConstants edgeConstants;
+    edgeConstants.TexelSize = { 1.0f / width, 1.0f / height };
+    edgeConstants.EdgeThreshold = 0.1f; // Настройте по вкусу
+    edgeConstants.Padding = 0.0f;
+
+    mEdgeDetectionCB->CopyData(0, edgeConstants);
+    cmdList->SetGraphicsRootConstantBufferView(1,
+        mEdgeDetectionCB->Resource()->GetGPUVirtualAddress());
+
+    // Устанавливаем рендер таргет
+    const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    cmdList->ClearRenderTargetView(outputRTV, clearColor, 0, nullptr);
+    cmdList->OMSetRenderTargets(1, &outputRTV, false, nullptr);
+
+    // Устанавливаем вьюпорт и ножницы
+    D3D12_VIEWPORT viewport = { 0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f };
+    D3D12_RECT scissorRect = { 0, 0, (LONG)width, (LONG)height };
+    cmdList->RSSetViewports(1, &viewport);
+    cmdList->RSSetScissorRects(1, &scissorRect);
+
+    // Рисуем полноэкранный треугольник
+    cmdList->IASetVertexBuffers(0, 0, nullptr);
+    cmdList->IASetIndexBuffer(nullptr);
+    cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    cmdList->DrawInstanced(4, 1, 0, 0);
+
+    // Возвращаем ресурсы в исходное состояние
+    CD3DX12_RESOURCE_BARRIER barriersAfter[] = {
+        CD3DX12_RESOURCE_BARRIER::Transition(
+            outputTexture,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+    };
+    cmdList->ResourceBarrier(_countof(barriersAfter), barriersAfter);
 }
 
 
