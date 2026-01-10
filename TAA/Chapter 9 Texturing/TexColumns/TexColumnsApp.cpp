@@ -274,7 +274,7 @@ bool TexColumnsApp::Initialize()
 	freopen("CONOUT$", "w", stdout);
 	freopen("CONOUT$", "w", stderr);
 
-	cam.SetPosition(0, 50, -160);
+	cam.SetPosition(0, 150, 0);
 	cam.RotateY(MathHelper::Pi);
 	if (!D3DApp::Initialize())
 		return false;
