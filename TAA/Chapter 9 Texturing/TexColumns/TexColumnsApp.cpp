@@ -11,6 +11,7 @@
 #include "RenderingSystem.h"
 #include "GBuffer.h"
 #include "HistoryBuffer.h"
+#include "EdgeDetectionSettings.h"
 #include <iostream>
 
 
@@ -112,6 +113,9 @@ private:
 		UINT tileResolution);
 	void BuildScreenQuadGeometry();
 	void BuildPSOs();
+	void InitializeEdgeDetection();
+	void BuildEdgeDetectionRootSignature();
+	void BuildEdgeDetectionPSO();
 	void BuildFrameResources();
 	void CreateMaterial(std::string _name, int _CBIndex, int _SRVDiffIndex, int _SRVNMapIndex, XMFLOAT4 _DiffuseAlbedo, XMFLOAT3 _FresnelR0, float _Roughness);
 	void BuildMaterials();
@@ -128,6 +132,7 @@ private:
 	void GeometryPass();
 	void GeometryTerrainPass();
 	void LightingPass();
+	void EdgeDetectionPass();
 	void ResolvePass();
 	void FinalTransitionAndPresent();
 
@@ -195,6 +200,12 @@ private:
 	float mRadius = 15.0f;
 
 	POINT mLastMousePos;
+
+	ComPtr<ID3D12RootSignature> mEdgeDetectionRootSignature = nullptr;
+	ComPtr<ID3D12PipelineState> mEdgeDetectionPSO = nullptr;
+	ComPtr<ID3D12Resource> mEdgeDetectionTexture = nullptr;
+	D3D12_CPU_DESCRIPTOR_HANDLE mEdgeDetectionRTV;
+	D3D12_CPU_DESCRIPTOR_HANDLE mEdgeDetectionSRV;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
@@ -286,6 +297,9 @@ bool TexColumnsApp::Initialize()
 	BuildShadersAndInputLayout();
 	BuildMaterials();
 	BuildPSOs();
+	InitializeEdgeDetection();
+	BuildEdgeDetectionRootSignature();
+	BuildEdgeDetectionPSO();
 	BuildRenderItems();
 	BuildFrameResources();
 	BuildLODs();
@@ -426,6 +440,14 @@ void TexColumnsApp::Update(const GameTimer& gt)
 	UpdateObjectCBs(gt);
 	UpdateMaterialCBs(gt);
 	UpdateMainPassCB(gt);
+
+	EdgeDetectionSettings edgeSettings;
+	edgeSettings.TexelSizeX = 1.0f / mClientWidth;
+	edgeSettings.TexelSizeY = 1.0f / mClientHeight;
+	edgeSettings.EdgeThreshold = 0.1f;
+	edgeSettings.Padding = 0.0f;
+
+	mCurrFrameResource->EdgeDetectionCB->CopyData(0, edgeSettings);
 	//cam.UpdateViewMatrix();
 	GetLOD();
 
@@ -613,6 +635,58 @@ void TexColumnsApp::LightingPass()
 
 }
 
+void TexColumnsApp::EdgeDetectionPass()
+{
+	// Переход входной текстуры в состояние SRV
+	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+		mEdgeDetectionTexture.Get(),
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_RENDER_TARGET));
+
+	// Установка рендер-таргета
+	mCommandList->OMSetRenderTargets(1, &mEdgeDetectionRTV, TRUE, nullptr);
+
+	// Очистка
+	const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+	mCommandList->ClearRenderTargetView(mEdgeDetectionRTV, clearColor, 0, nullptr);
+
+	// Установка PSO и корневой сигнатуры
+	mCommandList->SetPipelineState(mEdgeDetectionPSO.Get());
+	mCommandList->SetGraphicsRootSignature(mEdgeDetectionRootSignature.Get());
+
+	// Установка дескрипторных хипов
+	ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvDescriptorHeap.Get() };
+	mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
+
+	// Связываем входную текстуру (используем результат Lighting Pass)
+	CD3DX12_GPU_DESCRIPTOR_HANDLE inputTexHandle(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+	// History buffer как источник
+	inputTexHandle.Offset(mHistoryBuffer.SrvHeapStartIndex + 6, mCbvSrvDescriptorSize);
+	mCommandList->SetGraphicsRootDescriptorTable(0, inputTexHandle);
+
+	// Настройки Edge Detection
+	EdgeDetectionSettings edgeSettings;
+	edgeSettings.TexelSizeX = 1.0f / mClientWidth;
+	edgeSettings.TexelSizeY = 1.0f / mClientHeight;
+	edgeSettings.EdgeThreshold = 0.1f;
+
+	auto edgeDetectionCB = mCurrFrameResource->EdgeDetectionCB->Resource();
+	mCommandList->SetGraphicsRootConstantBufferView(1,
+		edgeDetectionCB->GetGPUVirtualAddress());
+
+	// Рисуем полноэкранный quad
+	mCommandList->IASetVertexBuffers(0, 0, nullptr);
+	mCommandList->IASetIndexBuffer(nullptr);
+	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	mCommandList->DrawInstanced(3, 1, 0, 0);
+
+	// Переход обратно в SRV состояние
+	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+		mEdgeDetectionTexture.Get(),
+		D3D12_RESOURCE_STATE_RENDER_TARGET,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+}
+
 void TexColumnsApp::ResolvePass()
 {
 	// Переход GBuffer SRV и BackBuffer в RTV
@@ -666,6 +740,10 @@ void TexColumnsApp::ResolvePass()
 	velocityHandle.Offset(7 + mHistoryBuffer.SrvHeapStartIndex, mCbvSrvDescriptorSize);
 	mCommandList->SetGraphicsRootDescriptorTable(2, velocityHandle);
 
+	CD3DX12_GPU_DESCRIPTOR_HANDLE edgesHandle(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+	edgesHandle.Offset((UINT)mTextures.size() + 4 + 4, mCbvSrvDescriptorSize);
+	mCommandList->SetGraphicsRootDescriptorTable(3, edgesHandle);
+
 	mHistoryBuffer.HistoryARead = !mHistoryBuffer.HistoryARead;
 	// Рисуем полноэкранный треугольник
 	mCommandList->IASetVertexBuffers(0, 0, nullptr);
@@ -676,9 +754,6 @@ void TexColumnsApp::ResolvePass()
 
 	mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), TRUE, nullptr);
 	mCommandList->DrawInstanced(3, 1, 0, 0);
-
-
-
 }
 
 void TexColumnsApp::FinalTransitionAndPresent()
@@ -712,6 +787,7 @@ void TexColumnsApp::Draw(const GameTimer& gt)
 	GeometryPass();
 	//GeometryTerrainPass();
 	LightingPass();
+	EdgeDetectionPass();
 	ResolvePass();
 	FinalTransitionAndPresent();
 }
@@ -1143,10 +1219,14 @@ void TexColumnsApp::BuildRootSignature()
 	CD3DX12_DESCRIPTOR_RANGE velocityRange;
 	velocityRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2
 
-	CD3DX12_ROOT_PARAMETER rootParams[3];
+	CD3DX12_DESCRIPTOR_RANGE edgesRange;
+	edgesRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3); // t3
+
+	CD3DX12_ROOT_PARAMETER rootParams[4];
 	rootParams[0].InitAsDescriptorTable(1, &historyRange, D3D12_SHADER_VISIBILITY_ALL);
 	rootParams[1].InitAsDescriptorTable(1, &currentRange, D3D12_SHADER_VISIBILITY_ALL);
 	rootParams[2].InitAsDescriptorTable(1, &velocityRange, D3D12_SHADER_VISIBILITY_ALL);
+	rootParams[3].InitAsDescriptorTable(1, &edgesRange, D3D12_SHADER_VISIBILITY_ALL);
 
 	CD3DX12_ROOT_SIGNATURE_DESC ResolveRootSigDesc(
 		_countof(rootParams), rootParams,
@@ -1186,9 +1266,10 @@ void TexColumnsApp::BuildDescriptorHeaps()
 	UINT numTextureSRVs = static_cast<UINT>(mTextures.size());
 	UINT numGBufferSRVs = 4; // albedo, normal, world pos, roughness
 	UINT numHistorySRVs = 4; // history, current, velocity
+	UINT numEdgeDetectionSRVs = 1;
 
 	D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-	srvHeapDesc.NumDescriptors = numTextureSRVs + numGBufferSRVs + numHistorySRVs;
+	srvHeapDesc.NumDescriptors = numTextureSRVs + numGBufferSRVs + numHistorySRVs + numEdgeDetectionSRVs;
 	srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 	srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&mSrvDescriptorHeap)));
@@ -1197,7 +1278,7 @@ void TexColumnsApp::BuildDescriptorHeaps()
 	// 2. Создаём RTV хип под GBuffer
 	//
 	D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
-	rtvHeapDesc.NumDescriptors = 4 + numHistorySRVs;
+	rtvHeapDesc.NumDescriptors = 4 + numHistorySRVs + 1;
 	rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
 	rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
 	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&mRtvDescriptorHeap)));
@@ -1922,6 +2003,143 @@ void TexColumnsApp::BuildPSOs()
 	resolvePsoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN; // нет глубины
 
 	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&resolvePsoDesc, IID_PPV_ARGS(&mPSOs["resolve"])));
+}
+
+void TexColumnsApp::InitializeEdgeDetection()
+{
+	// Создание текстуры для результата Edge Detection
+	D3D12_RESOURCE_DESC texDesc = {};
+	texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	texDesc.Width = mClientWidth;
+	texDesc.Height = mClientHeight;
+	texDesc.DepthOrArraySize = 1;
+	texDesc.MipLevels = 1;
+	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	texDesc.SampleDesc.Count = 1;
+	texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+	D3D12_CLEAR_VALUE clearValue = {};
+	clearValue.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	clearValue.Color[0] = 0.0f;
+	clearValue.Color[1] = 0.0f;
+	clearValue.Color[2] = 0.0f;
+	clearValue.Color[3] = 0.0f;
+
+	CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&heapProps,
+		D3D12_HEAP_FLAG_NONE,
+		&texDesc,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		&clearValue,
+		IID_PPV_ARGS(&mEdgeDetectionTexture)));
+
+	// Создание дескрипторов
+	UINT rtvDescriptorSize = md3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(mRtvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+
+	// Пропускаем предыдущие дескрипторы (GBuffer + HistoryBuffer)
+	rtvHandle.Offset(4 + 4, rtvDescriptorSize); // GBuffer(4) + HistoryBuffer(4)
+
+	// RTV
+	D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+	rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+	rtvDesc.Texture2D.MipSlice = 0;
+
+	md3dDevice->CreateRenderTargetView(mEdgeDetectionTexture.Get(), &rtvDesc, rtvHandle);
+	mEdgeDetectionRTV = rtvHandle;
+
+	// SRV (помещаем в общий SRV хип)
+	CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+
+	// Пропускаем текстуры, GBuffer, HistoryBuffer
+	UINT totalOffset = (UINT)mTextures.size() + 4 + 4; // текстуры + GBuffer + HistoryBuffer
+	srvHandle.Offset(totalOffset, mCbvSrvDescriptorSize);
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srvDesc.Texture2D.MipLevels = 1;
+
+	md3dDevice->CreateShaderResourceView(mEdgeDetectionTexture.Get(), &srvDesc, srvHandle);
+	mEdgeDetectionSRV = srvHandle;
+}
+
+void TexColumnsApp::BuildEdgeDetectionRootSignature()
+{
+	CD3DX12_DESCRIPTOR_RANGE texTable;
+	texTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
+
+	CD3DX12_ROOT_PARAMETER slotRootParameter[2];
+	slotRootParameter[0].InitAsDescriptorTable(1, &texTable, D3D12_SHADER_VISIBILITY_PIXEL);
+	slotRootParameter[1].InitAsConstantBufferView(0); // b0
+
+	auto staticSamplers = GetStaticSamplers(); // Эта функция уже есть
+
+	CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
+		2, slotRootParameter,
+		(UINT)staticSamplers.size(), staticSamplers.data(),
+		D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+	ComPtr<ID3DBlob> serializedRootSig = nullptr;
+	ComPtr<ID3DBlob> errorBlob = nullptr;
+
+	ThrowIfFailed(D3D12SerializeRootSignature(
+		&rootSigDesc,
+		D3D_ROOT_SIGNATURE_VERSION_1,
+		&serializedRootSig,
+		&errorBlob));
+
+	if (errorBlob != nullptr) {
+		::OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+	}
+
+	ThrowIfFailed(md3dDevice->CreateRootSignature(
+		0,
+		serializedRootSig->GetBufferPointer(),
+		serializedRootSig->GetBufferSize(),
+		IID_PPV_ARGS(&mEdgeDetectionRootSignature)));
+}
+
+void TexColumnsApp::BuildEdgeDetectionPSO()
+{
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC edgePsoDesc = {};
+
+	// Загружаем шейдеры
+	mShaders["edgeDetectionVS"] = d3dUtil::CompileShader(L"Shaders\\EdgeDetection.hlsl", nullptr, "VS", "vs_5_1");
+	mShaders["edgeDetectionPS"] = d3dUtil::CompileShader(L"Shaders\\EdgeDetection.hlsl", nullptr, "PS", "ps_5_1");
+
+	edgePsoDesc.InputLayout = { nullptr, 0 }; // Fullscreen quad не требует входных данных
+	edgePsoDesc.pRootSignature = mEdgeDetectionRootSignature.Get();
+	edgePsoDesc.VS = {
+		reinterpret_cast<BYTE*>(mShaders["edgeDetectionVS"]->GetBufferPointer()),
+		mShaders["edgeDetectionVS"]->GetBufferSize()
+	};
+	edgePsoDesc.PS = {
+		reinterpret_cast<BYTE*>(mShaders["edgeDetectionPS"]->GetBufferPointer()),
+		mShaders["edgeDetectionPS"]->GetBufferSize()
+	};
+
+	edgePsoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+	edgePsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	edgePsoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+	edgePsoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+	edgePsoDesc.DepthStencilState.DepthEnable = FALSE;
+	edgePsoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+	edgePsoDesc.SampleMask = UINT_MAX;
+	edgePsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	edgePsoDesc.NumRenderTargets = 1;
+	edgePsoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+	edgePsoDesc.SampleDesc.Count = 1;
+	edgePsoDesc.SampleDesc.Quality = 0;
+	edgePsoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+		&edgePsoDesc,
+		IID_PPV_ARGS(&mEdgeDetectionPSO)));
 }
 
 void TexColumnsApp::BuildFrameResources()

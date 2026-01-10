@@ -1,12 +1,14 @@
-Texture2D gInput : register(t0);
-SamplerState gsamLinearClamp : register(s3);
+// EdgeDetectionSimple.hlsl - максимально простой
 
-cbuffer cbEdgeDetection : register(b0)
+cbuffer cbSettings : register(b0)
 {
-    float2 gTexelSize;
-    float gEdgeThreshold;
+    float2 gTexelSize; // 1.0 / width, 1.0 / height
+    float gEdgeThreshold; // Порог обнаружения границ
     float gPadding;
 };
+
+Texture2D gInputTex : register(t0);
+SamplerState gsamPointClamp : register(s1);
 
 struct VertexOut
 {
@@ -18,69 +20,42 @@ VertexOut VS(uint vid : SV_VertexID)
 {
     VertexOut vout;
     
-    vout.TexC = float2(vid & 1, (vid & 2) >> 1);
-    vout.PosH = float4(vout.TexC * float2(4, -4) + float2(-1, 1), 0, 1);
+    float2 texCoord = float2((vid << 1) & 2, vid & 2);
+    vout.PosH = float4(texCoord * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+    vout.TexC = texCoord;
     
     return vout;
-}
-
-float GetLuminance(float3 color)
-{
-    return dot(color, float3(0.299f, 0.587f, 0.114f));
 }
 
 float4 PS(VertexOut pin) : SV_Target
 {
     float2 texCoord = pin.TexC;
     
-    float3x3 Gx = float3x3(
-        -1, 0, 1,
-        -2, 0, 2,
-        -1, 0, 1
-    );
+    // Центральный пиксель
+    float3 centerColor = gInputTex.Sample(gsamPointClamp, texCoord).rgb;
     
-    float3x3 Gy = float3x3(
-        1, 2, 1,
-        0, 0, 0,
-        -1, -2, -1
-    );
+    // 4 соседних пикселя
+    float3 upColor = gInputTex.Sample(gsamPointClamp, texCoord + float2(0, gTexelSize.y)).rgb;
+    float3 downColor = gInputTex.Sample(gsamPointClamp, texCoord - float2(0, gTexelSize.y)).rgb;
+    float3 leftColor = gInputTex.Sample(gsamPointClamp, texCoord - float2(gTexelSize.x, 0)).rgb;
+    float3 rightColor = gInputTex.Sample(gsamPointClamp, texCoord + float2(gTexelSize.x, 0)).rgb;
     
-    float luminance[9];
-    float2 offsets[9] =
-    {
-        float2(-1, -1), float2(0, -1), float2(1, -1),
-        float2(-1, 0), float2(0, 0), float2(1, 0),
-        float2(-1, 1), float2(0, 1), float2(1, 1)
-    };
+    // Вычисляем разницу в яркости
+    float centerLum = dot(centerColor, float3(0.299, 0.587, 0.114));
+    float upLum = dot(upColor, float3(0.299, 0.587, 0.114));
+    float downLum = dot(downColor, float3(0.299, 0.587, 0.114));
+    float leftLum = dot(leftColor, float3(0.299, 0.587, 0.114));
+    float rightLum = dot(rightColor, float3(0.299, 0.587, 0.114));
     
-    for (int i = 0; i < 9; i++)
-    {
-        float2 sampleUV = texCoord + offsets[i] * gTexelSize;
-        float3 color = gInput.Sample(gsamLinearClamp, sampleUV).rgb;
-        luminance[i] = GetLuminance(color);
-    }
+    // Вычисляем градиенты
+    float gradientX = (rightLum - leftLum);
+    float gradientY = (downLum - upLum);
     
-    float edgeX = 0.0f;
-    float edgeY = 0.0f;
+    // Магнитуда градиента
+    float edgeMagnitude = sqrt(gradientX * gradientX + gradientY * gradientY);
     
-    for (int i = 0; i < 3; i++)
-    {
-        for (int j = 0; j < 3; j++)
-        {
-            int idx = i * 3 + j;
-            edgeX += luminance[idx] * Gx[i][j];
-            edgeY += luminance[idx] * Gy[i][j];
-        }
-    }
+    // Пороговая обработка
+    float edge = edgeMagnitude > gEdgeThreshold ? 1.0 : 0.0;
     
-    float edgeMagnitude = sqrt(edgeX * edgeX + edgeY * edgeY);
-    
-    float edge = edgeMagnitude > gEdgeThreshold ? 1.0f : 0.0f;
-    
-    float3 originalColor = gInput.Sample(gsamLinearClamp, texCoord).rgb;
-    float3 edgeColor = float3(1.0f, 0.0f, 0.0f);
-    
-    float3 result = lerp(originalColor, edgeColor, edge);
-    
-    return float4(result, 1.0f);
+    return float4(edge, 0, 0, 1.0);
 }

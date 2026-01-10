@@ -95,6 +95,9 @@
     <ClInclude Include="HistoryBuffer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="EdgeDetectionSettings.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Text Include="Shaders\Default.hlsl" />
@@ -103,11 +106,9 @@
     <Text Include="Shaders\LightingPass.hlsl" />
     <Text Include="Shaders\Debug.hlsl" />
     <Text Include="Shaders\ResolvePass.hlsl" />
+    <Text Include="Shaders\EdgeDetection.hlsl" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
-  </ItemGroup>
-  <ItemGroup>
-    <FxCompile Include="Shaders\EdgeDetection.hlsl" />
   </ItemGroup>
 </Project>

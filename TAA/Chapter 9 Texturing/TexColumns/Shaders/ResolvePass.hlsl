@@ -4,6 +4,7 @@
 Texture2D gHistory : register(t0);
 Texture2D gCurrent : register(t1);
 Texture2D gVelocity : register(t2);
+Texture2D gEdges : register(t3);
 
 
 SamplerState gsamPointClamp : register(s1);
@@ -50,6 +51,9 @@ PSOutput PS(VertexOut pin)
 
     // Текущий пиксель и история
     float4 currentColor = gCurrent.Load(int3(pin.PosH.xy, 0));
+    
+    // Получаем границу для этого пикселя
+    float edgeValue = gEdges.Load(int3(pin.PosH.xy, 0)).r;
 
     // Берём смещение из velocity (в пикселях)
     float2 velocity = gVelocity.Load(int3(pin.PosH.xy, 0)).xy;
@@ -82,14 +86,13 @@ PSOutput PS(VertexOut pin)
     float weightHistory = 0.9 * historyColor.a;
     float weightCurr = 0.1 * currentColor.a;
 
-    
-    
-    
-    
-    
-    
     //float4 blendedColor = ClampedColor * weightHistory + currentColor * weightCurr;
     float4 blendedColor = ClampedColor * 0.9 + currentColor * 0.1;
+    
+    if (edgeValue > 0.5)  // Если это граница
+    {
+        blendedColor.rgb = float3(1.0, 0.0, 0.0);
+    }
     
     output.RT0 = blendedColor;
     return output;

@@ -182,6 +182,7 @@
     <ClInclude Include="..\..\Common\MathHelper.h" />
     <ClInclude Include="..\..\Common\model.h" />
     <ClInclude Include="..\..\Common\UploadBuffer.h" />
+    <ClInclude Include="EdgeDetectionSettings.h" />
     <ClInclude Include="FrameResource.h" />
     <ClInclude Include="GBuffer.h" />
     <ClInclude Include="HistoryBuffer.h" />
@@ -219,7 +220,9 @@
     <None Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
-    <FxCompile Include="Shaders\EdgeDetection.hlsl" />
+    <Text Include="Shaders\EdgeDetection.hlsl">
+      <FileType>Document</FileType>
+    </Text>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

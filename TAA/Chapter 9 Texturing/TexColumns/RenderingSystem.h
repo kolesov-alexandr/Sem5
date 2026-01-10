@@ -69,14 +69,6 @@ public:
     const std::unordered_map<std::string, ComPtr<ID3D12PipelineState>>& GetPSOs() const;
     std::unordered_map<std::string, std::unique_ptr<Material>>* mMaterials;
 
-    void BuildEdgeDetectionPSO();
-    void ExecuteEdgeDetection(ID3D12GraphicsCommandList* cmdList,
-        ID3D12Resource* inputTexture,
-        D3D12_CPU_DESCRIPTOR_HANDLE inputSRV,
-        ID3D12Resource* outputTexture,
-        D3D12_CPU_DESCRIPTOR_HANDLE outputRTV,
-        UINT width, UINT height);
-
 private:
     std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> GetStaticSamplers();
 
@@ -92,15 +84,4 @@ private:
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
 
     UINT mCbvSrvDescriptorSize = 0;
-
-    ComPtr<ID3D12PipelineState> mEdgeDetectionPSO;
-    ComPtr<ID3D12RootSignature> mEdgeDetectionRootSignature;
-
-    struct EdgeDetectionConstants
-    {
-        DirectX::XMFLOAT2 TexelSize;
-        float EdgeThreshold;
-        float Padding;
-    };
-    std::unique_ptr<UploadBuffer<EdgeDetectionConstants>> mEdgeDetectionCB;
 };
