@@ -223,6 +223,10 @@ GBufferData OriginalNormalPS(VertexOut pin)
     float3 normalMap = gNormalMap.Sample(gsamAnisotropicWrap, pin.TexC).rgb;
     
     float4 diffuseAlbedo = gDiffuseMap.Sample(gsamAnisotropicWrap, pin.TexC);
+#ifdef ALPHA_TEST
+    // Alpha cut-out (for foliage/grass cards).
+    clip(diffuseAlbedo.a - 0.5f);
+#endif
 
     pout.diffuse = diffuseAlbedo;
     pout.zwzanashih_RGBA32F = float4(0.f, 0.f, 0.f, pin.PosH.z);
@@ -239,7 +243,7 @@ GBufferData DeferredPS(VertexOut pin)
     
     float3 normalMap = gNormalMap.Sample(gsamAnisotropicWrap, pin.TexC).rgb;
     if (length(normalMap) != 0.f)
-    {    
+    {
 	// TBN
         float3 bitangent = (cross(pin.NormalL, pin.Tangent));
         bitangent = normalize(mul(bitangent, (float3x3) gWorld));
@@ -255,6 +259,10 @@ GBufferData DeferredPS(VertexOut pin)
         normalMap = normalize(pin.NormalL);
     
     float4 diffuseAlbedo = gDiffuseMap.Sample(gsamAnisotropicWrap, pin.TexC);
+#ifdef ALPHA_TEST
+    // Alpha cut-out (for foliage/grass cards).
+    clip(diffuseAlbedo.a - 0.5f);
+#endif
 
     pout.diffuse = diffuseAlbedo;
     pout.zwzanashih_RGBA32F = float4(0.f, 0.f, 0.f, pin.PosH.z);

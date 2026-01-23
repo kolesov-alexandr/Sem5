@@ -2,15 +2,15 @@
 
 #define PI 3.14159265359
 
-Texture2DArray gShadowMap   : register(t0);
-Texture2D gDiffuse          : register(t1);
-Texture2D gZW               : register(t2);
-Texture2D gNormal           : register(t3);
-Texture2D gMaterialAlbedo   : register(t4);
+Texture2DArray gShadowMap : register(t0);
+Texture2D gDiffuse : register(t1);
+Texture2D gZW : register(t2);
+Texture2D gNormal : register(t3);
+Texture2D gMaterialAlbedo : register(t4);
 Texture2D gMaterialFresnelRoughness : register(t5);
-TextureCube gSkyDiffuse             : register(t6);
-TextureCube gSkyIrradiance          : register(t7);
-Texture2D gSkyBrdf                  : register(t8);
+TextureCube gSkyDiffuse : register(t6);
+TextureCube gSkyIrradiance : register(t7);
+Texture2D gSkyBrdf : register(t8);
 
 SamplerState gsamPointWrap : register(s0);
 SamplerState gsamPointClamp : register(s1);
@@ -111,49 +111,9 @@ float3 RestoreWorldPosition(float2 UV, float depth)
 
 float CalcRTShadow(uint2 TexelCoord)
 {
-    //blur depth map
-    static const float Kernel[21] =
-    {
-        0.0000000000000000, 0.0000000000014940, 0.0000000002951600,
-        0.0000000273766000, 0.0000014462100000, 0.0000487016000000,
-        0.0010722200000000, 0.0154509000000000, 0.1479700000000000,
-        0.8936300000000000, 1.0000000000000000,
-        0.8936300000000000, 0.1479700000000000, 0.0154509000000000,
-        0.0010722200000000, 0.0000487016000000, 0.0000014462100000,
-        0.0000000273766000, 0.0000000002951600, 0.0000000000014940,
-        0.0000000000000000
-    };
-    
-    float blurStrength = 2.0f;
-    
-    float result = 0.0f;
-    float kernelSum = 0.0f;
-    
-    [unroll]
-    for (int x = -10; x <= 10; x++)
-    {
-        [unroll]
-        for (int y = -10; y <= 10; y++)
-        {
-            float2 offset = float2(x, y) / gRenderTargetSize * blurStrength;
-            uint2 sampleCoord = TexelCoord + uint2(offset * gRenderTargetSize);
-            
-            if (sampleCoord.x < gRenderTargetSize.x && sampleCoord.y < gRenderTargetSize.y)
-            {
-                float kernelValue = Kernel[x + 10] * Kernel[y + 10];
-                float sampleValue = gShadowMap.Load(int4(sampleCoord, 0, 0)).x;
-                result += sampleValue * kernelValue;
-                kernelSum += kernelValue;
-            }
-        }
-    }
-    
-    if (kernelSum > 0.0f)
-    {
-        result /= kernelSum;
-    }
-    
-    return result;
+    // No blur: preserves alpha-cutout "holes" in the shadow and avoids driver/compiler quirks.
+    int2 tc = int2(TexelCoord);
+    return gShadowMap.Load(int4(tc, 0, 0)).x;
 }
 
 struct VertexIn
@@ -218,7 +178,7 @@ float4 PS(VertexOut vo) : SV_Target
     float4 currentLight;
     
     if (LightType == 0) // direction
-        {
+    {
         
         shadowFactor = CalcRTShadow(pixelC);
         
@@ -247,31 +207,31 @@ float4 PS(VertexOut vo) : SV_Target
         float3 Lo = (kD * diffuseAlbedo.rgb / PI + specular) * radiance * NdotL;
         
         currentLight = float4(shadowFactor * Lo, 1.0f);
-    } 
+    }
     else if (LightType == 1) // point
-        {
-            float3 lightToPixel = posW - light.Position;
-            float distToLight = length(lightToPixel);
-            lightToPixel /= distToLight;
+    {
+        float3 lightToPixel = posW - light.Position;
+        float distToLight = length(lightToPixel);
+        lightToPixel /= distToLight;
     
             // determine shadow map cube face index
-            float3 absDir = abs(lightToPixel);
-            uint faceIndex = 0;
-            if (absDir.x >= absDir.y && absDir.x >= absDir.z)
-                faceIndex = (lightToPixel.x > 0) ? 0 : 1;
-            else if (absDir.y >= absDir.z)
-                faceIndex = (lightToPixel.y > 0) ? 2 : 3;
-            else
-                faceIndex = (lightToPixel.z > 0) ? 4 : 5;
+        float3 absDir = abs(lightToPixel);
+        uint faceIndex = 0;
+        if (absDir.x >= absDir.y && absDir.x >= absDir.z)
+            faceIndex = (lightToPixel.x > 0) ? 0 : 1;
+        else if (absDir.y >= absDir.z)
+            faceIndex = (lightToPixel.y > 0) ? 2 : 3;
+        else
+            faceIndex = (lightToPixel.z > 0) ? 4 : 5;
             
-            shadowFactor = CalcRTShadow(pixelC);
-            currentLight = float4(ComputePointLight(light, mat, posW, normal, toEyeW) * shadowFactor, 1.0f);
-    } 
+        shadowFactor = CalcRTShadow(pixelC);
+        currentLight = float4(ComputePointLight(light, mat, posW, normal, toEyeW) * shadowFactor, 1.0f);
+    }
     else // spot
-        {
-            shadowFactor = CalcRTShadow(pixelC);
-            currentLight = float4(ComputeSpotLight(light, mat, posW, normal, toEyeW) * shadowFactor, 1.0f);
-        }
+    {
+        shadowFactor = CalcRTShadow(pixelC);
+        currentLight = float4(ComputeSpotLight(light, mat, posW, normal, toEyeW) * shadowFactor, 1.0f);
+    }
     
     currentLight = currentLight * float4(LColor, 1.f);
     

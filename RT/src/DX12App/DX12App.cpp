@@ -26,6 +26,7 @@ const int gNumFrameResources = 3;
 enum class RenderLayer : int
 {
 	Opaque = 0,
+	AlphaTest,
 	Debug,
 	Sky,
 	Terrain,
@@ -153,6 +154,7 @@ private:
 	void BuildBLASForGeometries();
 	void BuildTLAS();
 	void RefitTLAS();
+	void BuildRTAlphaTestResources();
 
 	// Quad Tree for Terrain
 	Node* BuildNode(int layer, float x, float y, int xi, int yi);
@@ -208,7 +210,7 @@ private:
 	Node* root = nullptr;
 	int layers = 4;
 	float RootSize = 1024.f;
-	float thresholds[5] = {1500.f, 1000.f, 500.f, 200.f, 100.f};
+	float thresholds[5] = { 1500.f, 1000.f, 500.f, 200.f, 100.f };
 
 	// rt typa shit
 	Microsoft::WRL::ComPtr<ID3D12Resource> mTLASResource;
@@ -216,6 +218,12 @@ private:
 	int mTLASSRVHeapIndex;
 	Microsoft::WRL::ComPtr<ID3D12Resource> mInstanceDescsResource;
 	Microsoft::WRL::ComPtr<ID3D12Resource> mInstanceDescsUploadResource;
+
+	// RT alpha-test support (instance -> (geo buffers, diffuse texture, tex-scale, cutoff))
+	Microsoft::WRL::ComPtr<ID3D12Resource> mRTInstanceDataBuffer;
+	UINT mRTBindlessBaseHeapIndex = 0;
+	UINT mRTBindlessTexturesCount = 0;
+	UINT mRTBindlessGeometriesCount = 0;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
@@ -280,6 +288,7 @@ bool DX12App::Initialize()
 	BuildRenderItems();
 	BuildTerrainQuadTree();
 	BuildLightObjects();
+	BuildRTAlphaTestResources();
 	BuildFrameResources();
 	BuildPSOs();
 	BuildBLASForGeometries();
@@ -318,7 +327,7 @@ void DX12App::CreateRtvAndDsvDescriptorHeaps()
 }
 
 void DX12App::OnResize()
-{ 
+{
 	D3DApp::OnResize();
 
 	// The window resized, so update the aspect ratio and recompute the projection matrix.
@@ -604,7 +613,7 @@ void DX12App::UpdateObjectCBs(const GameTimer& gt)
 	for (auto& e : mAllRitems)
 	{
 		XMMATRIX world = XMLoadFloat4x4(&e->World);
-		
+
 		if (e->NumFramesDirty > 0)
 		{
 			XMMATRIX texTransform = XMLoadFloat4x4(&e->TexTransform);
@@ -736,7 +745,7 @@ void DX12App::UpdateLightCBs(const GameTimer& gt)
 			{
 				XMStoreFloat4x4(&lightConstants.World,
 					XMMatrixTranspose(XMMatrixScaling(e->FalloffEnd * e->Strength.x, e->FalloffEnd * e->Strength.y, e->FalloffEnd * e->Strength.z)
-					* XMMatrixTranslation(e->Position.x, e->Position.y, e->Position.z)));
+						* XMMatrixTranslation(e->Position.x, e->Position.y, e->Position.z)));
 
 				lightPos = XMLoadFloat3(&e->Position);
 
@@ -879,6 +888,9 @@ void DX12App::LoadTextures()
 	LoadTexture("bricks_norm", L"../Textures/tile_nmap.dds");
 	LoadTexture("bricks_disp", L"../Textures/checkboard.dds");
 
+	// Alpha-cutout texture for demo (guaranteed alpha). We'll use it as a "grass card".
+	LoadTexture("grass_alpha", L"../Textures/WireFence.dds");
+
 	// Baronyx
 	LoadTexture("baryonyx_diffuse", L"../Textures/baryonyx_diffuse.dds");
 
@@ -900,10 +912,10 @@ void DX12App::LoadTerrainTextures()
 			{
 				LoadTexture("tile_diffuse_level" + std::to_string(layer) + "_" + std::to_string(x) + "_" + std::to_string(y),
 					L"../Textures/Terrain/L" + std::to_wstring(layer) + L"/diffuse/tile_diffuse_level" + std::to_wstring(layer) + L"_" + std::to_wstring(x) + L"_" + std::to_wstring(y) + L".dds");
-				
+
 				LoadTexture("tile_height_level" + std::to_string(layer) + "_" + std::to_string(x) + "_" + std::to_string(y),
 					L"../Textures/Terrain/L" + std::to_wstring(layer) + L"/height/tile_height_level" + std::to_wstring(layer) + L"_" + std::to_wstring(x) + L"_" + std::to_wstring(y) + L".dds");
-				
+
 				LoadTexture("tile_normal_level" + std::to_string(layer) + "_" + std::to_string(x) + "_" + std::to_string(y),
 					L"../Textures/Terrain/L" + std::to_wstring(layer) + L"/normal/tile_normal_level" + std::to_wstring(layer) + L"_" + std::to_wstring(x) + L"_" + std::to_wstring(y) + L".dds");
 			}
@@ -911,8 +923,8 @@ void DX12App::LoadTerrainTextures()
 
 void DX12App::BuildRootSignature()
 {
-	CD3DX12_DESCRIPTOR_RANGE texTables[10];
-	for (int i = 0; i < 10; i++) {
+	CD3DX12_DESCRIPTOR_RANGE texTables[9];
+	for (int i = 0; i < 9; i++) {
 		texTables[i].Init(
 			D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
 			1,  // number of descriptors
@@ -923,8 +935,27 @@ void DX12App::BuildRootSignature()
 	CD3DX12_ROOT_PARAMETER slotRootParameter[20];
 
 	// Perfomance TIP: Order from most frequent to least frequent.
+	for (int i = 0; i < 9; i++) {
+		slotRootParameter[i].InitAsDescriptorTable(1, &texTables[i], D3D12_SHADER_VISIBILITY_ALL); // 0-8   = fixed SRVs
+	}
+
+	// Root parameter 9: one descriptor table for RT alpha-test "bindless block".
+	// Layout in heap (starting at mRTBindlessBaseHeapIndex):
+	// [0 .. TexCount-1]                    = Texture2D (space1)
+	// [TexCount .. TexCount+GeoCount-1]    = StructuredBuffer<Vertex> (space2)
+	// [.. +GeoCount .. +2*GeoCount-1]      = ByteAddressBuffer Index (space3)
+	// [last]                               = StructuredBuffer<uint4> instance data (space4)
+	CD3DX12_DESCRIPTOR_RANGE rtRanges[4];
+	// NOTE: counts here are MAXIMUMS; we will only fill/use the first N in each range.
+	const UINT kMaxRTBindlessTextures = 512;
+	const UINT kMaxRTBindlessGeometries = 256;
+	rtRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kMaxRTBindlessTextures, 0, 1); // t0 space1
+	rtRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kMaxRTBindlessGeometries, 0, 2); // t0 space2
+	rtRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kMaxRTBindlessGeometries, 0, 3); // t0 space3
+	rtRanges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 4); // t0 space4
+	slotRootParameter[9].InitAsDescriptorTable(_countof(rtRanges), rtRanges, D3D12_SHADER_VISIBILITY_ALL);
+
 	for (int i = 0; i < 10; i++) {
-		slotRootParameter[i].InitAsDescriptorTable(1, &texTables[i], D3D12_SHADER_VISIBILITY_ALL); // 0-9   = textures
 		slotRootParameter[i + 10].InitAsConstantBufferView(i);									   // 10-19 = CBs
 	}
 
@@ -987,7 +1018,7 @@ void DX12App::BuildDescriptorHeaps()
 	hDescriptor.Offset(1, mCbvSrvDescriptorSize);
 
 	// texture descriptors except default "black"
-	for (auto &Tex : mTextures)
+	for (auto& Tex : mTextures)
 	{
 		if (Tex.first == "black") continue;
 
@@ -1003,7 +1034,7 @@ void DX12App::BuildDescriptorHeaps()
 			srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
 			srvDesc.Texture2D.MipLevels = tex->GetDesc().MipLevels;
 			break;
-			
+
 		case TextureType::CUBEMAP:
 			srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
 			srvDesc.TextureCube.MostDetailedMip = 0;
@@ -1044,7 +1075,9 @@ void DX12App::BuildShadersAndInputLayout()
 	mShaders["curtainsGS"] = DXCCompileShader(L"Shaders\\DeferredGeometry.hlsl", nullptr, "curtainsGS", L"gs_6_5");
 	mShaders["deferredPS"] = DXCCompileShader(L"Shaders\\DeferredGeometry.hlsl", nullptr, "DeferredPS", L"ps_6_5");
 	mShaders["originalNormalPS"] = DXCCompileShader(L"Shaders\\DeferredGeometry.hlsl", nullptr, "OriginalNormalPS", L"ps_6_5");
-	
+	mShaders["deferredAlphaTestPS"] = DXCCompileShader(L"Shaders\\DeferredGeometry.hlsl", alphaTestDefines, "DeferredPS", L"ps_6_5");
+	mShaders["originalNormalAlphaTestPS"] = DXCCompileShader(L"Shaders\\DeferredGeometry.hlsl", alphaTestDefines, "OriginalNormalPS", L"ps_6_5");
+
 	mShaders["shadowVS"] = DXCCompileShader(L"Shaders\\Shadows.hlsl", nullptr, "VS", L"vs_6_5");
 	mShaders["shadowGS"] = DXCCompileShader(L"Shaders\\Shadows.hlsl", nullptr, "GS", L"gs_6_5");
 	mShaders["shadowOpaquePS"] = DXCCompileShader(L"Shaders\\Shadows.hlsl", nullptr, "PS", L"ps_6_5");
@@ -1061,7 +1094,7 @@ void DX12App::BuildShadersAndInputLayout()
 	mShaders["RTLightsVS"] = DXCCompileShader(L"Shaders\\RTLights.hlsl", nullptr, "VS", L"vs_6_5");
 	mShaders["RTLightsGeometryVS"] = DXCCompileShader(L"Shaders\\RTLights.hlsl", nullptr, "LightsGeometryVS", L"vs_6_5");
 	mShaders["RTLightsPS"] = DXCCompileShader(L"Shaders\\RTLights.hlsl", nullptr, "PS", L"ps_6_5");
-	
+
 	mShaders["postVS"] = DXCCompileShader(L"Shaders\\PostProcessing.hlsl", nullptr, "VS", L"vs_6_5");
 	mShaders["postPS"] = DXCCompileShader(L"Shaders\\PostProcessing.hlsl", nullptr, "PS", L"ps_6_5");
 
@@ -1074,6 +1107,270 @@ void DX12App::BuildShadersAndInputLayout()
 	};
 }
 
+struct RTInstanceData
+{
+	UINT VertexSrvIndex;       // StructuredBuffer<Vertex>
+	UINT IndexSrvIndex;        // ByteAddressBuffer
+	UINT DiffuseTexSrvIndex;   // Texture2D
+	float AlphaCutoff;         // typical 0.5
+	float TexScale;            // matches RenderItem::scaleTex (uniform scale)
+	UINT IndexFormat;          // 0 = R16_UINT, 1 = R32_UINT
+	UINT _pad0;
+	UINT _pad1;
+};
+
+void DX12App::BuildRTAlphaTestResources()
+{
+	// Create a contiguous "bindless block" in the global SRV heap.
+	// We place it AFTER existing SRVs (textures + TLAS + gbuffer + shadow maps).
+	UINT heapIndex = mShadowMapHeapIndex + (UINT)mAllLights.size();
+	mRTBindlessBaseHeapIndex = heapIndex;
+
+	auto cpuStart = mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
+
+	// Must match sizes used in the root signature ranges.
+	const UINT kMaxRTBindlessTextures = 512;
+	const UINT kMaxRTBindlessGeometries = 256;
+
+	// 1) Bindless Texture2D list (only TEXTURE2D; others map to "black").
+	// Map original heap index -> bindless texture index.
+	std::unordered_map<UINT, UINT> texHeapToBindless;
+	UINT bindlessTexIndex = 0;
+
+	// Ensure we always have something at 0 (black).
+	{
+		auto* black = mTextures["black"].get();
+		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Texture2D.MostDetailedMip = 0;
+		srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+		srvDesc.Format = black->Resource->GetDesc().Format;
+		srvDesc.Texture2D.MipLevels = black->Resource->GetDesc().MipLevels;
+
+		CD3DX12_CPU_DESCRIPTOR_HANDLE h(cpuStart, heapIndex++, mCbvSrvUavDescriptorSize);
+		md3dDevice->CreateShaderResourceView(black->Resource.Get(), &srvDesc, h);
+		texHeapToBindless[black->SrvHeapIndex] = bindlessTexIndex++;
+	}
+
+	for (auto& kv : mTextures)
+	{
+		auto* tex = kv.second.get();
+		if (!tex || tex->Name == "black") continue;
+		if (tex->Type != TextureType::TEXTURE2D) continue;
+
+		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Texture2D.MostDetailedMip = 0;
+		srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+		srvDesc.Format = tex->Resource->GetDesc().Format;
+		srvDesc.Texture2D.MipLevels = tex->Resource->GetDesc().MipLevels;
+
+		CD3DX12_CPU_DESCRIPTOR_HANDLE h(cpuStart, heapIndex++, mCbvSrvUavDescriptorSize);
+		md3dDevice->CreateShaderResourceView(tex->Resource.Get(), &srvDesc, h);
+		texHeapToBindless[tex->SrvHeapIndex] = bindlessTexIndex++;
+	}
+
+	mRTBindlessTexturesCount = bindlessTexIndex;
+
+	// IMPORTANT: Root signature expects the VB block to start at table offset kMaxRTBindlessTextures.
+	// So we must pad the heap with dummy Texture2D SRVs up to that size.
+	if (mTextures.find("black") != mTextures.end())
+	{
+		auto* black = mTextures["black"].get();
+		D3D12_SHADER_RESOURCE_VIEW_DESC blackSrv = {};
+		blackSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		blackSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		blackSrv.Texture2D.MostDetailedMip = 0;
+		blackSrv.Texture2D.ResourceMinLODClamp = 0.0f;
+		blackSrv.Format = black->Resource->GetDesc().Format;
+		blackSrv.Texture2D.MipLevels = black->Resource->GetDesc().MipLevels;
+
+		while (bindlessTexIndex < kMaxRTBindlessTextures)
+		{
+			CD3DX12_CPU_DESCRIPTOR_HANDLE h(cpuStart, heapIndex++, mCbvSrvUavDescriptorSize);
+			md3dDevice->CreateShaderResourceView(black->Resource.Get(), &blackSrv, h);
+			bindlessTexIndex++;
+		}
+	}
+
+	// 2) Bindless VB/IB SRVs per geometry (order must match bindless geometry index).
+	std::vector<MeshGeometry*> geoList;
+	geoList.reserve(mGeometries.size());
+	for (auto& kv : mGeometries) geoList.push_back(kv.second.get());
+
+	UINT bindlessGeoIndex = 0;
+	// IMPORTANT: ranges in root signature expect VB block contiguous, THEN IB block contiguous.
+	// First create all VB SRVs.
+	MeshGeometry* firstValidGeo = nullptr;
+	for (auto* geo : geoList)
+	{
+		if (!geo || !geo->VertexBufferGPU || !geo->IndexBufferGPU) continue;
+		if (!firstValidGeo) firstValidGeo = geo;
+
+		// VB SRV.
+		{
+			D3D12_SHADER_RESOURCE_VIEW_DESC vbSrv = {};
+			vbSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			vbSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+			vbSrv.Format = DXGI_FORMAT_UNKNOWN;
+			vbSrv.Buffer.FirstElement = 0;
+			vbSrv.Buffer.NumElements = geo->GetTotalVertexCount();
+			vbSrv.Buffer.StructureByteStride = sizeof(Vertex);
+			vbSrv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+
+			CD3DX12_CPU_DESCRIPTOR_HANDLE h(cpuStart, heapIndex++, mCbvSrvUavDescriptorSize);
+			md3dDevice->CreateShaderResourceView(geo->VertexBufferGPU.Get(), &vbSrv, h);
+		}
+
+		// Store bindless indices (relative to bindless VB/IB arrays, not heap indices).
+		geo->VertexSrvHeapIndex = bindlessGeoIndex;
+		geo->IndexSrvHeapIndex = bindlessGeoIndex;
+		bindlessGeoIndex++;
+	}
+
+	mRTBindlessGeometriesCount = bindlessGeoIndex;
+
+	// Pad VB block up to kMaxRTBindlessGeometries so that IB block starts at correct offset.
+	if (firstValidGeo)
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC vbSrv = {};
+		vbSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		vbSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+		vbSrv.Format = DXGI_FORMAT_UNKNOWN;
+		vbSrv.Buffer.FirstElement = 0;
+		vbSrv.Buffer.NumElements = firstValidGeo->GetTotalVertexCount();
+		vbSrv.Buffer.StructureByteStride = sizeof(Vertex);
+		vbSrv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+
+		while (bindlessGeoIndex < kMaxRTBindlessGeometries)
+		{
+			CD3DX12_CPU_DESCRIPTOR_HANDLE h(cpuStart, heapIndex++, mCbvSrvUavDescriptorSize);
+			md3dDevice->CreateShaderResourceView(firstValidGeo->VertexBufferGPU.Get(), &vbSrv, h);
+			bindlessGeoIndex++;
+		}
+	}
+
+	// Then create all IB SRVs in the same geometry order/count.
+	UINT createdGeo = 0;
+	for (auto* geo : geoList)
+	{
+		if (!geo || !geo->VertexBufferGPU || !geo->IndexBufferGPU) continue;
+		if (createdGeo >= mRTBindlessGeometriesCount) break;
+
+		D3D12_SHADER_RESOURCE_VIEW_DESC ibSrv = {};
+		ibSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		ibSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+		ibSrv.Format = DXGI_FORMAT_R32_TYPELESS;
+		ibSrv.Buffer.FirstElement = 0;
+		ibSrv.Buffer.NumElements = geo->IndexBufferByteSize / 4;
+		ibSrv.Buffer.StructureByteStride = 0;
+		ibSrv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+
+		CD3DX12_CPU_DESCRIPTOR_HANDLE h(cpuStart, heapIndex++, mCbvSrvUavDescriptorSize);
+		md3dDevice->CreateShaderResourceView(geo->IndexBufferGPU.Get(), &ibSrv, h);
+		createdGeo++;
+	}
+
+	// Pad IB block up to kMaxRTBindlessGeometries.
+	if (firstValidGeo)
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC ibSrv = {};
+		ibSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		ibSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+		ibSrv.Format = DXGI_FORMAT_R32_TYPELESS;
+		ibSrv.Buffer.FirstElement = 0;
+		ibSrv.Buffer.NumElements = firstValidGeo->IndexBufferByteSize / 4;
+		ibSrv.Buffer.StructureByteStride = 0;
+		ibSrv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+
+		while (createdGeo < kMaxRTBindlessGeometries)
+		{
+			CD3DX12_CPU_DESCRIPTOR_HANDLE h(cpuStart, heapIndex++, mCbvSrvUavDescriptorSize);
+			md3dDevice->CreateShaderResourceView(firstValidGeo->IndexBufferGPU.Get(), &ibSrv, h);
+			createdGeo++;
+		}
+	}
+
+	// 3) Per-instance data aligned with TLAS InstanceID.
+	// HLSL reads this as StructuredBuffer<uint4> with 2 uint4's per instance.
+	std::vector<DirectX::XMUINT4> instances;
+	instances.resize(mAllRitems.size() * 2);
+
+	auto PackFloatToUInt = [](float f) -> UINT
+		{
+			UINT u = 0;
+			static_assert(sizeof(UINT) == sizeof(float), "UINT/float size mismatch");
+			memcpy(&u, &f, sizeof(UINT));
+			return u;
+		};
+
+	for (UINT i = 0; i < (UINT)mAllRitems.size(); ++i)
+	{
+		auto& ri = mAllRitems[i];
+		UINT vbIndex = 0, ibIndex = 0, texIndex = 0, indexFormat = 0;
+		float alphaCutoff = -1.0f; // negative => treat as opaque (commit without sampling alpha)
+		float texScale = 1.0f;
+
+		if (ri && ri->Geo)
+		{
+			vbIndex = ri->Geo->VertexSrvHeapIndex; // bindless geometry index
+			ibIndex = ri->Geo->IndexSrvHeapIndex;  // bindless geometry index
+			indexFormat = (ri->Geo->IndexFormat == DXGI_FORMAT_R32_UINT) ? 1u : 0u;
+		}
+		if (ri && ri->Mat)
+		{
+			const UINT originalTexHeap = (UINT)ri->Mat->DiffuseSrvHeapIndex;
+			auto it = texHeapToBindless.find(originalTexHeap);
+			texIndex = (it != texHeapToBindless.end()) ? it->second : 0u; // fallback to black
+
+			if (ri->Mat->Name == "grassAlpha")
+				alphaCutoff = 0.5f;
+		}
+
+		// Alpha cutoff and tex-scale (BuildRenderItem uses uniform scaling matrix for TexTransform).
+		texScale = ri ? ri->TexTransform._11 : 1.0f; // scaleTex
+
+		instances[i * 2 + 0] = DirectX::XMUINT4(vbIndex, ibIndex, texIndex, indexFormat);
+		instances[i * 2 + 1] = DirectX::XMUINT4(
+			PackFloatToUInt(alphaCutoff),
+			PackFloatToUInt(texScale),
+			0u, 0u);
+	}
+
+	// Upload buffer for instance data (SRV-visible).
+	const UINT64 byteSize = (UINT64)instances.size() * sizeof(DirectX::XMUINT4);
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(byteSize),
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(&mRTInstanceDataBuffer)));
+	mRTInstanceDataBuffer->SetName(L"RT_InstanceData");
+
+	void* mapped = nullptr;
+	ThrowIfFailed(mRTInstanceDataBuffer->Map(0, nullptr, &mapped));
+	memcpy(mapped, instances.data(), (size_t)byteSize);
+	mRTInstanceDataBuffer->Unmap(0, nullptr);
+
+	// SRV for instance data: StructuredBuffer<RTInstanceData>.
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+		srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+		srv.Format = DXGI_FORMAT_UNKNOWN;
+		srv.Buffer.FirstElement = 0;
+		srv.Buffer.NumElements = (UINT)instances.size();
+		srv.Buffer.StructureByteStride = sizeof(DirectX::XMUINT4);
+		srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+
+		CD3DX12_CPU_DESCRIPTOR_HANDLE h(cpuStart, heapIndex, mCbvSrvUavDescriptorSize);
+		md3dDevice->CreateShaderResourceView(mRTInstanceDataBuffer.Get(), &srv, h);
+	}
+}
+
 void DX12App::BuildShapeGeometry()
 {
 	GeometryGenerator geoGen;
@@ -1081,6 +1378,7 @@ void DX12App::BuildShapeGeometry()
 
 	// if you want to generate new model -- generate it here
 	allMeshData.push_back(geoGen.CreateGrid(1.0f, 1.0f, 128, 128, 1.0f));           // grid
+	allMeshData.push_back(geoGen.CreateGrid(1.0f, 1.0f, 2, 2, 1.0f));               // quad (2 triangles). m,n must be >= 2
 	allMeshData.push_back(geoGen.CreateBox(10.0f, 10.0f, 10.0f, 3));                // box
 	allMeshData.push_back(geoGen.LoadModel("..\\Models\\trex.obj"));             // trex
 	allMeshData.push_back(geoGen.LoadModel("..\\Models\\Baryonyx.obj"));         // baryonyx
@@ -1090,6 +1388,7 @@ void DX12App::BuildShapeGeometry()
 	// NOOO
 	std::vector<std::string> geometryNames = {
 	 "grid",
+	 "quad",
 	 "box",
 	 "trex",
 	 "Baryonyx",
@@ -1292,6 +1591,16 @@ void DX12App::BuildPSOs()
 	deferredGeometryPsoDesc.RTVFormats[3] = DXGI_FORMAT_R8G8B8A8_UNORM;        // diffuse albedo
 	deferredGeometryPsoDesc.RTVFormats[4] = DXGI_FORMAT_R8G8B8A8_UNORM;        // fresnel & roughness
 	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&deferredGeometryPsoDesc, IID_PPV_ARGS(&mPSOs["deferredGeometry"])));
+
+	// Alpha-tested geometry (foliage/grass cards) for deferred pass.
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC deferredAlphaPsoDesc = deferredGeometryPsoDesc;
+	deferredAlphaPsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; // cards are usually double-sided
+	deferredAlphaPsoDesc.PS =
+	{
+		reinterpret_cast<BYTE*>(mShaders["deferredAlphaTestPS"]->GetBufferPointer()),
+		mShaders["deferredAlphaTestPS"]->GetBufferSize()
+	};
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&deferredAlphaPsoDesc, IID_PPV_ARGS(&mPSOs["deferredGeometryAlphaTest"])));
 
 	deferredGeometryPsoDesc.VS =
 	{
@@ -1497,6 +1806,16 @@ void DX12App::BuildMaterials()
 
 	mMaterials[bricks0->Name] = std::move(bricks0);
 
+	// Alpha-tested "grass card" material (for demo).
+	auto grassAlpha = std::make_unique<Material>();
+	grassAlpha->Name = "grassAlpha";
+	grassAlpha->MatCBIndex = matCBI++;
+	grassAlpha->DiffuseSrvHeapIndex = mTextures["grass_alpha"]->SrvHeapIndex;
+	grassAlpha->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+	grassAlpha->FresnelR0 = XMFLOAT3(0.02f, 0.02f, 0.02f);
+	grassAlpha->Roughness = 0.9f;
+	mMaterials[grassAlpha->Name] = std::move(grassAlpha);
+
 	auto gorg = std::make_unique<Material>();
 	gorg->Name = "gorg";
 	gorg->MatCBIndex = matCBI++;
@@ -1591,12 +1910,24 @@ RenderItem* DX12App::BuildRenderItem(std::string name, std::string material, XMM
 
 void DX12App::BuildRenderItems()
 {
-	BuildRenderItem("box", "sky", XMMatrixIdentity(), nullptr, (int) RenderLayer::Sky, 5000.0f);
+	BuildRenderItem("box", "sky", XMMatrixIdentity(), nullptr, (int)RenderLayer::Sky, 5000.0f);
 
 	BuildRenderItem("box", "bricks0", XMMatrixScaling(100.f, 1.f, 100.f) * XMMatrixTranslation(0.f, -10.f, 0.f), nullptr, 0, 1.f, 10.f);
+
+	// Alpha-tested "grass card" demo: a standing quad above the ground casting a cut-out shadow.
+	BuildRenderItem(
+		"quad",
+		"grassAlpha",
+		XMMatrixRotationX(-XM_PIDIV2) * XMMatrixRotationY(0.6f) * XMMatrixTranslation(0.f, -5.f, -5.f),
+		nullptr,
+		(int)RenderLayer::AlphaTest,
+		20.0f,
+		2.0f
+	);
+
 	BuildRenderItem("trex", "trex", XMMatrixTranslation(40.f, -5.f, -60.f), nullptr, 0, 2.f);
 
-	std::vector<std::string> BaryonyxLODs = {"Baryonyx", "box"};
+	std::vector<std::string> BaryonyxLODs = { "Baryonyx", "box" };
 	BuildRenderItem("Baryonyx", "gorg", XMMatrixTranslation(0.f, -5.f, 20.f), nullptr);
 	BuildRenderItem("Baryonyx", "gorg", XMMatrixTranslation(-30.f, -5.f, 40.f), nullptr);
 	BuildRenderItem("Baryonyx", "gorg", XMMatrixTranslation(30.f, -5.f, 0.f), nullptr);
@@ -1619,7 +1950,7 @@ void DX12App::BuildLightObjects()
 	dir1->Strength = { 2.f, 2.f, 2.f };
 	dir1->Direction = { 0.57735f, -0.57735f, 0.57735f };
 	mAllLights.push_back(std::move(dir1));
-	
+
 	auto spot1 = std::make_unique<LightObject>();
 	spot1->LightType = LightType::Spotlight;
 	spot1->Color = { 1.f, 0.243f, 0.584f };  // pink
@@ -1686,7 +2017,7 @@ void DX12App::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vec
 		// register texture in t0
 		CD3DX12_GPU_DESCRIPTOR_HANDLE texHandle(
 			mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
-			textureIndex,  // Смещение в куче дескрипторов
+			textureIndex,  // ???????? ? ???? ????????????
 			mCbvSrvDescriptorSize
 		);
 		cmdList->SetGraphicsRootDescriptorTable(0, texHandle);
@@ -1694,7 +2025,7 @@ void DX12App::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vec
 		// register texture in t1
 		CD3DX12_GPU_DESCRIPTOR_HANDLE texHandle1(
 			mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
-			normalIndex,  // Смещение в куче дескрипторов
+			normalIndex,  // ???????? ? ???? ????????????
 			mCbvSrvDescriptorSize
 		);
 		cmdList->SetGraphicsRootDescriptorTable(1, texHandle1);
@@ -1702,7 +2033,7 @@ void DX12App::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vec
 		// register texture in t2
 		CD3DX12_GPU_DESCRIPTOR_HANDLE texHandle2(
 			mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
-			displaceIndex,  // Смещение в куче дескрипторов
+			displaceIndex,  // ???????? ? ???? ????????????
 			mCbvSrvDescriptorSize
 		);
 		cmdList->SetGraphicsRootDescriptorTable(2, texHandle2);
@@ -1722,7 +2053,7 @@ void DX12App::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vec
 		}
 		else if (ri->currentLOD < ri->LODGeoNames.size())
 		{
-			auto &item = mGeometries[ri->LODGeoNames.at(ri->currentLOD)]->DrawArgs[ri->LODGeoNames.at(ri->currentLOD)];
+			auto& item = mGeometries[ri->LODGeoNames.at(ri->currentLOD)]->DrawArgs[ri->LODGeoNames.at(ri->currentLOD)];
 			cmdList->IASetVertexBuffers(0, 1, &mGeometries[ri->LODGeoNames.at(ri->currentLOD)]->VertexBufferView());
 			cmdList->IASetIndexBuffer(&mGeometries[ri->LODGeoNames.at(ri->currentLOD)]->IndexBufferView());
 			cmdList->DrawIndexedInstanced(item.IndexCount, 1, item.StartIndexLocation, item.BaseVertexLocation, 0);
@@ -1761,11 +2092,15 @@ void DX12App::DrawDeferredGeometry()
 	mCommandList->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	DrawRenderItems(mCommandList.Get(), mVisibleRitems[(int)RenderLayer::Opaque]);
 
-	
+	// Alpha-tested cards (grass/fences/foliage).
+	mCommandList->SetPipelineState(mPSOs["deferredGeometryAlphaTest"].Get());
+	DrawRenderItems(mCommandList.Get(), mVisibleRitems[(int)RenderLayer::AlphaTest]);
+
+
 	// terrain w/ tessellation draw
 	/*mCommandList->SetPipelineState(mPSOs["terrainGeometry"].Get());
 	DrawRenderItems(mCommandList.Get(), mVisibleTerrain);*/
-	
+
 	for (int i = 0; i < (int)RenderLayer::Count; i++)
 	{
 		mVisibleRitems[i].clear();
@@ -1925,8 +2260,14 @@ void DX12App::DrawShadowMaps()
 		mTLASSRVHeapIndex,
 		mCbvSrvDescriptorSize
 	));
+	// RT alpha-test bindless block (textures/buffers/instance-data)
+	mCommandList->SetGraphicsRootDescriptorTable(9, CD3DX12_GPU_DESCRIPTOR_HANDLE(
+		mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
+		mRTBindlessBaseHeapIndex,
+		mCbvSrvDescriptorSize
+	));
 
-	for (auto &Light : mAllLights)
+	for (auto& Light : mAllLights)
 	{
 		auto shadowMap = Light->shadowMap;
 
@@ -1983,7 +2324,7 @@ void DX12App::BuildTLAS()
 {
 	std::vector<std::pair<Microsoft::WRL::ComPtr<ID3D12Resource>, DirectX::XMMATRIX>> instances;
 
-	for (auto &ri : mAllRitems) {
+	for (auto& ri : mAllRitems) {
 		DirectX::XMMATRIX worldMatrix = DirectX::XMLoadFloat4x4(&ri->World);
 		instances.emplace_back(ri->Geo->BLASResource, worldMatrix);
 	}
@@ -2202,7 +2543,7 @@ Node* DX12App::BuildNode(int layer, float x, float y, int xi, int yi)
 	Node* node = new Node();
 	node->layer = layer;
 
-	float scaleFactor = RootSize / ( 1 << layer );
+	float scaleFactor = RootSize / (1 << layer);
 
 	std::string debugString = std::to_string(layer) + "_" + std::to_string(xi) + "_" + std::to_string(yi) + "\n";
 	//OutputDebugStringA(debugString.c_str());
@@ -2224,7 +2565,7 @@ Node* DX12App::BuildNode(int layer, float x, float y, int xi, int yi)
 							{1.f, -1.f},
 							{1.f, 1.f} };
 
-	int coords[4][2] =		{{0, 1},
+	int coords[4][2] = { {0, 1},
 							{0, 0},
 							{1, 1},
 							{1, 0} };
@@ -2232,7 +2573,7 @@ Node* DX12App::BuildNode(int layer, float x, float y, int xi, int yi)
 	for (int i = 0; i < 4; i++)
 	{
 		node->children[i] = BuildNode(layer + 1, x + offsets[i].x * scaleFactor * 0.25f, y + offsets[i].y * scaleFactor * 0.25f,
-					xi * 2 + coords[i][0], yi * 2 + coords[i][1]);
+			xi * 2 + coords[i][0], yi * 2 + coords[i][1]);
 	}
 
 	return node;
@@ -2246,7 +2587,7 @@ void DX12App::BuildTerrainQuadTree()
 void DX12App::UpdateVisibleTerrainTiles()
 {
 	mVisibleTerrain.clear();
-	
+
 	ChooseVisibleTerrainTile(root);
 }
 
@@ -2336,6 +2677,6 @@ std::array<const CD3DX12_STATIC_SAMPLER_DESC, 7> DX12App::GetStaticSamplers()
 		pointWrap, pointClamp,
 		linearWrap, linearClamp,
 		anisotropicWrap, anisotropicClamp,
-		shadow};
+		shadow };
 }
 
